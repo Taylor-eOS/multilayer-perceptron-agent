@@ -6,17 +6,22 @@ import numpy as np
 from collections import deque
 
 GRID_SIZE = 5
-STATE_SIZE = GRID_SIZE * GRID_SIZE * 3
+STATE_SIZE = GRID_SIZE * GRID_SIZE * 4 + 4 * 5 + 2 * 5
 ACTION_SIZE = 4
 HIDDEN_SIZE = 128
 LEARNING_RATE = 0.001
 GAMMA = 0.99
 MEMORY_SIZE = 10000
 BATCH_SIZE = 64
-EPISODES = 5000
+EPISODES = 15000
 MAX_STEPS = 50
 EXPLORATION_INTERVAL = 100
 EXPLORATION_EPISODE_LENGTH = 20
+ACTION_HISTORY_LENGTH = 5
+POSITION_HISTORY_LENGTH = 5
+CORNERS = [(0,0), (0, GRID_SIZE-1), (GRID_SIZE-1,0), (GRID_SIZE-1, GRID_SIZE-1)]
+STUCK_PENALTY = -0.5
+STEP_LIMIT_PENALTY = -0.5
 
 class MLP(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
@@ -36,17 +41,31 @@ class GridEnv:
         self.grid_size = grid_size
         self.reset()
     def reset(self):
-        self.agent_pos = [random.randint(0, self.grid_size-1), random.randint(0, self.grid_size-1)]
-        self.food_pos = [random.randint(0, self.grid_size-1), random.randint(0, self.grid_size-1)]
-        while self.food_pos == self.agent_pos:
-            self.food_pos = [random.randint(0, self.grid_size-1), random.randint(0, self.grid_size-1)]
+        positions = [(i, j) for i in range(self.grid_size) for j in range(self.grid_size)]
+        self.agent_pos = list(random.choice(positions))
+        positions.remove(tuple(self.agent_pos))
+        self.food_pos = list(random.choice(positions))
+        positions.remove(tuple(self.food_pos))
+        self.poison_pos = list(random.choice(positions))
         self.done = False
+        self.step_count = 0
+        self.action_history = deque(maxlen=ACTION_HISTORY_LENGTH)
+        self.position_history = deque(maxlen=POSITION_HISTORY_LENGTH)
+        self.position_history.append(tuple(self.agent_pos))
         return self.get_state()
     def get_state(self):
-        state = np.zeros((self.grid_size, self.grid_size, 3), dtype=np.float32)
+        state = np.zeros((self.grid_size, self.grid_size, 4), dtype=np.float32)
         state[self.agent_pos[0]][self.agent_pos[1]][0] = 1.0
         state[self.food_pos[0]][self.food_pos[1]][1] = 1.0
-        return state.flatten()
+        state[self.poison_pos[0]][self.poison_pos[1]][2] = 1.0
+        action_history_encoded = np.zeros(ACTION_HISTORY_LENGTH * ACTION_SIZE, dtype=np.float32)
+        for idx, action in enumerate(self.action_history):
+            action_history_encoded[idx * ACTION_SIZE + action] = 1.0
+        position_history_encoded = np.zeros(POSITION_HISTORY_LENGTH * 2, dtype=np.float32)
+        for idx, pos in enumerate(self.position_history):
+            position_history_encoded[idx * 2] = pos[0] / (self.grid_size - 1)
+            position_history_encoded[idx * 2 + 1] = pos[1] / (self.grid_size - 1)
+        return np.concatenate([state.flatten(), action_history_encoded, position_history_encoded])
     def step(self, action):
         if action == 0 and self.agent_pos[0] > 0:
             self.agent_pos[0] -= 1
@@ -56,10 +75,25 @@ class GridEnv:
             self.agent_pos[1] -= 1
         elif action == 3 and self.agent_pos[1] < self.grid_size -1:
             self.agent_pos[1] += 1
+        self.action_history.append(action)
+        self.position_history.append(tuple(self.agent_pos))
+        self.step_count += 1
         reward = -0.1
+        done_flag = False
         if self.agent_pos == self.food_pos:
             reward = 1.0
             self.done = True
+            done_flag = True
+        elif self.agent_pos == self.poison_pos:
+            reward = -1.0
+            self.done = True
+            done_flag = True
+        elif self.step_count >= MAX_STEPS:
+            reward += STEP_LIMIT_PENALTY
+            self.done = True
+            done_flag = True
+        if tuple(self.agent_pos) in CORNERS and not done_flag:
+            reward += STUCK_PENALTY
         return self.get_state(), reward, self.done
 
 class ReplayMemory:
@@ -106,13 +140,22 @@ class Agent:
         loss.backward()
         self.optimizer.step()
 
-def main():
+def train():
     env = GridEnv(GRID_SIZE)
     agent = Agent(STATE_SIZE, ACTION_SIZE, HIDDEN_SIZE, LEARNING_RATE, GAMMA, MEMORY_SIZE, BATCH_SIZE)
     exploration_count = 0
+    total_rewards = 0
+    total_successes = 0
+    total_poisons = 0
+    total_step_limit_penalties = 0
+    total_stuck_penalties = 0
     for episode in range(EPISODES):
         state = env.reset()
-        total_reward = 0
+        episode_reward = 0
+        episode_success = 0
+        episode_poison = 0
+        episode_step_limit = 0
+        episode_stuck = 0
         if exploration_count < EPISODES // EXPLORATION_INTERVAL:
             explore = True
             exploration_count += 1
@@ -126,14 +169,37 @@ def main():
             next_state, reward, done = env.step(action)
             agent.memory.push(state, action, reward, next_state, done)
             state = next_state
-            total_reward += reward
+            episode_reward += reward
+            if reward == 1.0:
+                episode_success = 1
+            elif reward == -1.0:
+                episode_poison = 1
+            elif reward <= STEP_LIMIT_PENALTY:
+                episode_step_limit = 1
+            elif reward <= STUCK_PENALTY:
+                episode_stuck = 1
             agent.train_step()
             if done:
                 break
+        total_rewards += episode_reward
+        total_successes += episode_success
+        total_poisons += episode_poison
+        total_step_limit_penalties += episode_step_limit
+        total_stuck_penalties += episode_stuck
         if (episode+1) % 100 == 0:
-            print(f"Episode {episode+1}, Total Reward: {total_reward}")
+            average_reward = total_rewards / 100
+            average_success = total_successes
+            average_poison = total_poisons
+            average_step_limit = total_step_limit_penalties
+            average_stuck = total_stuck_penalties
+            print(f"Average reward: {average_reward}, success: {average_success}, fail: {average_poison}, step limit: {average_step_limit}, stuck: {average_stuck}")
+            total_rewards = 0
+            total_successes = 0
+            total_poisons = 0
+            total_step_limit_penalties = 0
+            total_stuck_penalties = 0
     torch.save(agent.model.state_dict(), "mlp_agent.pth")
 
 if __name__ == "__main__":
-    main()
+    train()
 
